@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  agent:
+    build: .
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./computer_use_demo:/app/computer_use_demo
+      - ./logs:/app/logs
+    command: >
+      sh -c "mkdir -p /app/logs && python -u -m computer_use_demo.loop 2>&1 | tee /app/logs/agent.log"
+    environment:
+      - PYTHONUNBUFFERED=1
+    user: "${UID:-1000}:${GID:-1000}"  # Use host user's UID/GID or default to 1000 
