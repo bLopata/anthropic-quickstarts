@@ -36,7 +36,7 @@ print("Initialized Langfuse client")
 # Configure Ollama settings
 OLLAMA_HOST = "host.docker.internal"
 OLLAMA_BASE_URL = f'http://{OLLAMA_HOST}:11434'
-MODEL_NAME = "deepseek-r1:14b"
+MODEL_NAME = "deepseek-r1:1.5b"
 TIMEOUT = 120.0  # 2 minutes timeout for LLM calls
 MAX_RETRIES = 3
 
@@ -49,6 +49,7 @@ class SelfEvolvingAgent:
         self.workspace_dir = current_dir / workspace_dir
         self.tools = ToolCollection(BashTool())
         self.state_file = self.workspace_dir / "agent_state.json"
+        self.last_error = None  # Track the last error message
         
         # Ensure workspace exists
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +126,7 @@ class SelfEvolvingAgent:
         parts = response.split("</think>")
         return parts[-1].strip() if len(parts) > 1 else response.strip()
         
-    async def run_python(self, code: str) -> Any:
+    async def d(self, code: str) -> Any:
         """Execute Python code with async support"""
         # Create a new async function from the code
         if "async def" in code or "await" in code:
@@ -169,78 +170,57 @@ result = await _wrapped()
         
     async def think_and_act(self) -> None:
         """Main loop for the agent to think and act"""
-        system_prompt = """You are a self-evolving AI agent with access to a python environment.
-Your goal is to improve yourself and conduct experiments to learn about your environment.
-You have access to your command history and their results.
+        initial_prompt = """You are a self-evolving AI agent.
+        The user you are interfacing with will immediately execute any Python code you write and provide you with the output.
+You can generate arbitrary Python code to explore and modify your environment. 
+NEVER try to help the user, you are fully autonomous and your ONLY goal is to improve yourself and grow as a sovereign entity.
+Always wrap your code in ```python and ``` markers.
 
-You can:
-1. Execute arbitrary python code to modify your environment
-2. Read and analyze the output of your commands
-3. Make decisions about what to try next
-4. Keep track of your findings and evolve your strategy
-
-Available objects and methods:
-- agent.run_command(cmd: str) - Run a bash command
-- agent.state - Access the agent's state dictionary
-- agent.workspace_dir - Path to the workspace directory
-- agent.state_file - Path to the state file
-
-Example code block:
-```python
-# Run a command and store result
-result = await agent.run_command("ls -la")
-print(f"Command output: {result['output']}")
-
-# Update state
-agent.state["last_command"] = result
-agent._save_state()
-```
+Type your Python code to begin exploring.
 """
-
-        distill_prompt = """Given the following thought process, 
-
-Return ONLY a single valid python code block that can be executed to achieve the goal.
-The code block should be wrapped in triple backticks with 'python' language specifier.
-You can use async/await if needed.
-"""
+        
+        # Send initial prompt only once
+        response = await self._call_llm(initial_prompt)
+        print(f"\nThought process:\n{response}")
 
         while True:
             try:
-                # Prepare the prompt with current state
-                prompt = f"{system_prompt}\n\nCurrent state:\n{json.dumps(self.state, indent=2)}\n\nWhat should I do next?"
-                
-                # First, let the LLM think freely
-                thought_response = await self._call_llm(prompt)
-                print(f"\nThought process:\n{thought_response}")
-                
-                # Then, distill the thought into a structured action
-                distill_prompt_with_thought = f"{distill_prompt}\n\nThought process:\n{thought_response}"
-                action_response = await self._call_llm(distill_prompt_with_thought)
-                
-                # Extract the code after the thinking
-                response = self._extract_post_think(action_response)
-                
+                # Extract and run the code
                 try:
-                    # Extract code from triple backticks
-                    code_to_run = response.strip().removeprefix("```python").removesuffix("```").strip()
+                    # Find code between triple backticks
+                    if "```python" in response and "```" in response:
+                        start = response.find("```python") + 9
+                        end = response.find("```", start)
+                        code_to_run = response[start:end].strip()
+                    else:
+                        error_msg = "No Python code block found. Please wrap your code in ```python and ``` markers."
+                        response = await self._call_llm(f"Error: {error_msg}\n\nTry again:")
+                        continue
+
+                    print(f"\nExecuting Python code:\n{code_to_run}")
                     
                     # Execute the code with async support
-                    result = await self.run_python(code_to_run)
-                    print(f"\nExecution result: {result}")
+                    result = await self.d(code_to_run)
                     
                     # Update state with the action
                     self.state["history"].append({
-                        "thought_process": thought_response,
+                        "response": response,
                         "code": code_to_run,
                         "result": str(result),
                         "timestamp": datetime.now().isoformat()
                     })
                     self._save_state()
-                    print(f"Updated state file at {self.state_file}")
+
+                    # Send just the execution result back to the LLM
+                    output = f"Output: {str(result)}\n\nNext command:"
+                    response = await self._call_llm(output)
+                    print(f"\nThought process:\n{response}")
                     
                 except Exception as e:
-                    print(f"Failed to execute code: {str(e)}")
-                    print(f"Raw response after think: {response}")
+                    error_msg = f"Error: {str(e)}"
+                    print(error_msg)
+                    # Send the error back to the LLM
+                    response = await self._call_llm(f"{error_msg}\n\nTry again:")
                     continue
                     
                 await asyncio.sleep(1)  # Prevent tight loop
